@@ -1,0 +1,21 @@
+[project]
+name = "sql-debug-env"
+version = "1.0.0"
+description = "A real-world SQL debugging and analytics environment where AI agents learn to examine database schemas, diagnose broken queries, write business analytics SQL, and craft complex multi-table analytical queries using window functions."
+authors = [{name = "Dhakshin Kotha", email = "2024aib1009@iitrpr.ac.in"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.6.0",
+    "openai>=1.14.0",
+    "requests>=2.31.0",
+    "pyyaml>=6.0.1",
+    "gradio>=4.26.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
