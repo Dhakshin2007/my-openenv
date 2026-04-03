@@ -1,0 +1,164 @@
+name: sql-debug-env
+version: "1.0.0"
+description: >
+  A real-world SQL debugging and analytics environment where AI agents learn to
+  examine database schemas, diagnose broken queries, write business analytics SQL,
+  and craft complex multi-table analytical queries using window functions.
+author: "Dhakshin Kotha"
+email: "2024aib1009@iitrpr.ac.in"
+tags:
+  - sql
+  - debugging
+  - analytics
+  - databases
+  - real-world
+  - openenv
+
+tasks:
+  - id: fix_broken_query
+    name: "Fix the Broken SQL Query"
+    difficulty: easy
+    max_steps: 25
+    score_range: [0.0, 1.0]
+    description: >
+      The agent is given an e-commerce database and a SQL query containing
+      multiple bugs (typos in column/table names, wrong alias references, invalid
+      ORDER BY direction). The agent must identify all bugs and submit a corrected
+      query that returns the expected result set.
+
+  - id: write_business_query
+    name: "Write a Business Analytics Query"
+    difficulty: medium
+    max_steps: 25
+    score_range: [0.0, 1.0]
+    description: >
+      The agent is given an HR database (employees + departments) and a natural-
+      language specification. It must write SQL that produces per-department
+      statistics — employee count, average salary, top earner — filtered to
+      departments with more than one employee, ordered by average salary DESC.
+
+  - id: complex_analytics
+    name: "Complex Multi-table Analytics"
+    difficulty: hard
+    max_steps: 25
+    score_range: [0.0, 1.0]
+    description: >
+      The agent is given a three-table sales database (products, sales, regions)
+      and must write SQL that computes total revenue per category per country for
+      2023 only, then returns the top-2 categories by revenue for each country
+      using window functions (ROW_NUMBER / RANK).
+
+  - id: recursive_org_hierarchy
+    name: "Recursive Org-Chart Query"
+    difficulty: hard
+    max_steps: 25
+    score_range: [0.0, 1.0]
+    description: >
+      The agent must write a WITH RECURSIVE CTE to traverse a company org chart
+      downward from the CTO, computing depth level, manager name, and number of
+      active projects per person — including 0 for employees with none.
+      Tests recursive SQL, LEFT JOINs, and hierarchical thinking.
+
+  - id: data_quality_audit
+    name: "Data Quality Audit Pipeline"
+    difficulty: hard
+    max_steps: 25
+    score_range: [0.0, 1.0]
+    description: >
+      The agent must write a single SQL query (using UNION ALL) that surfaces
+      five types of data quality issues in a customer/transactions database:
+      duplicate emails, null names, invalid amounts, orphan transactions, and
+      future-dated records. Tests the ability to combine multiple analytical
+      checks into a single structured report.
+
+action_space:
+  type: discrete_typed
+  actions:
+    - name: examine_schema
+      fields:
+        - name: table_name
+          type: string
+          required: true
+      description: "Retrieve schema definition and 3-row sample for a named table."
+
+    - name: run_query
+      fields:
+        - name: sql
+          type: string
+          required: true
+      description: "Execute an arbitrary SELECT query and observe up to 10 rows."
+
+    - name: explain_query
+      fields:
+        - name: sql
+          type: string
+          required: true
+      description: "Run EXPLAIN QUERY PLAN on a SELECT to inspect the execution plan."
+
+    - name: submit_solution
+      fields:
+        - name: sql
+          type: string
+          required: true
+      description: "Submit the final SQL query for deterministic grading. Ends the episode."
+
+observation_space:
+  type: structured
+  fields:
+    - name: task_id
+      type: string
+    - name: task_description
+      type: string
+    - name: available_tables
+      type: list[string]
+    - name: last_result
+      type: any
+      nullable: true
+    - name: last_error
+      type: string
+      nullable: true
+    - name: query_history
+      type: list[object]
+    - name: step_count
+      type: integer
+    - name: done
+      type: boolean
+    - name: message
+      type: string
+
+reward:
+  type: shaped
+  range: [-1.0, 1.0]
+  components:
+    - name: step_cost
+      value: -0.01
+      description: "Applied every step to encourage efficiency."
+    - name: examine_schema_bonus
+      value: +0.03
+      description: "Reward for inspecting table schema."
+    - name: run_query_success
+      value: +0.05
+      description: "Reward for successfully executing a query."
+    - name: run_query_error
+      value: -0.05
+      description: "Penalty for a query that returns a syntax/runtime error."
+    - name: submit_graded
+      value: "0.0–1.0"
+      description: "Grader score minus step cost — drives the final performance signal."
+    - name: max_steps_penalty
+      value: -0.10
+      description: "Applied when the episode reaches MAX_STEPS without submission."
+
+endpoints:
+  reset: "POST /reset?task_id={task_id}"
+  step: "POST /step/{session_id}"
+  state: "GET /state/{session_id}"
+  tasks: "GET /tasks"
+  health: "GET /health"
+
+infrastructure:
+  runtime: python3.11
+  framework: fastapi
+  database: sqlite3 (in-memory, per session)
+  port: 7860
+  max_concurrent_sessions: 50
