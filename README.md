@@ -1,3 +1,15 @@
+---
+title: SQL Debug Environment — OpenEnv
+emoji: 🛢️
+colorFrom: blue
+colorTo: green
+sdk: docker
+sdk_version: "latest"
+python_version: "3.11"
+app_file: app.py
+pinned: false
+---
+
 # 🛢️ SQL Debug Environment — OpenEnv
 
 > A real-world OpenEnv environment where AI agents learn to **debug broken SQL queries**, **write business analytics**, and **craft complex multi-table analytical queries**.
@@ -175,21 +187,13 @@ sql-debug-env/
 
 The Space URL will look like:
 ```
-https://<your-username>-sql-debug-env.hf.space
+https://DhakshinK-sql-debug-env.hf.space
 ```
 
 Use this as `API_BASE_URL` in your `inference.py`.
 
 ---
 
-## ⚙️ Environment Variables for Inference
-
-| Variable | Description | Default |
-|---|---|---|
-| `API_BASE_URL` | OpenEnv server URL | `http://localhost:7860` |
-| `MODEL_NAME` | LLM model identifier | `gpt-4o-mini` |
-| `HF_TOKEN` | Hugging Face / OpenAI API key | *(required)* |
-| `LLM_BASE_URL` | OpenAI-compatible API base URL | `https://api.openai.com/v1` |
 
 ---
 
