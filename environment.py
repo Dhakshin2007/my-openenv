@@ -396,15 +396,29 @@ class SQLDebugEnv:
 
     def _execute(self, sql: str) -> Tuple[Optional[List[Dict]], Optional[str]]:
         try:
-            cur     = self._conn.cursor()
+            cur = self._conn.cursor()
             results = []
-            for stmt in sql.split(";"):
-                stmt = stmt.strip()
-                if stmt:
-                    cur.execute(stmt)
-                    if cur.description:
-                        cols    = [d[0] for d in cur.description]
-                        results = [dict(zip(cols, row)) for row in cur.fetchall()]
+            sql_stripped = sql.strip()
+            
+            try:
+                # Try executing the entire sql string as-is first
+                cur.execute(sql_stripped)
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    results = [dict(zip(cols, row)) for row in cur.fetchall()]
+            except sqlite3.Error as e:
+                # Only if it fails due to "multiple statements" error, fall back to splitting
+                if "execute one statement" in str(e) or "multiple statements" in str(e).lower():
+                    for stmt in sql_stripped.split(";"):
+                        stmt = stmt.strip()
+                        if stmt:
+                            cur.execute(stmt)
+                            if cur.description:
+                                cols = [d[0] for d in cur.description]
+                                results = [dict(zip(cols, row)) for row in cur.fetchall()]
+                else:
+                    raise e
+                    
             self._conn.commit()
             return results, None
         except Exception as exc:
@@ -444,11 +458,31 @@ class SQLDebugEnv:
         self._chaos_triggered = True
         try:
             cur = self._conn.cursor()
-            # Inject a 'silent' corruption in the products table if it exists
             if "products" in self._task["schema"]:
-                cur.execute("INSERT INTO products VALUES (999, 'Chaos Item', 'Electronics', -99.99, 13)")
-                self._conn.commit()
-                print("🚨 CHAOS MONKEY: Late-stage corruption injected into 'products'!")
+                cur.execute("PRAGMA table_info(products)")
+                cols = [row[1] for row in cur.fetchall()]
+                
+                mapping = {
+                    "id": 999,
+                    "product_id": 999,
+                    "name": "'Chaos Item'",
+                    "category": "'Electronics'",
+                    "price": -99.99,
+                    "stock": 13
+                }
+                
+                insert_cols = []
+                insert_vals = []
+                for c in cols:
+                    c_lower = c.lower()
+                    if c_lower in mapping:
+                        insert_cols.append(c)
+                        insert_vals.append(str(mapping[c_lower]))
+                
+                if insert_cols:
+                    sql = f"INSERT INTO products ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals)})"
+                    cur.execute(sql)
+                    self._conn.commit()
         except Exception:
             pass
 

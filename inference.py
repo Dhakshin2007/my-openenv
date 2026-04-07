@@ -62,7 +62,6 @@ STRATEGY:
 
 
 def call_llm(messages: list) -> str:
-    """Call the LLM with conversation history. Returns the raw text response."""
     response = llm.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
@@ -78,9 +77,7 @@ def call_llm(messages: list) -> str:
 
 
 def parse_action(text: str) -> dict:
-    """Parse LLM output into an action dict. Falls back to submit on parse error."""
     text = text.strip()
-    # Strip optional markdown fences
     if text.startswith("```"):
         lines = text.splitlines()
         inner = [l for l in lines if not l.startswith("```")]
@@ -88,7 +85,6 @@ def parse_action(text: str) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to extract first JSON object
         start = text.find("{")
         end = text.rfind("}") + 1
         if start != -1 and end > start:
@@ -96,7 +92,6 @@ def parse_action(text: str) -> dict:
                 return json.loads(text[start:end])
             except json.JSONDecodeError:
                 pass
-    # Fallback
     return {"action_type": "submit_solution", "sql": "SELECT 'parse_error' AS error"}
 
 
@@ -106,8 +101,7 @@ def env_post(path: str, **kwargs) -> dict:
         r = requests.post(url, timeout=30, **kwargs)
         r.raise_for_status()
         return r.json()
-    except Exception as exc:
-        print(f"  [env_post] Error at {path}: {exc}")
+    except Exception:
         raise
 
 
@@ -117,25 +111,19 @@ def env_get(path: str) -> dict:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         return r.json()
-    except Exception as exc:
-        print(f"  [env_get] Error at {path}: {exc}")
+    except Exception:
         raise
 
 
 def run_episode(task_id: str) -> float:
-    """Run one full episode for *task_id*. Returns the grader score (0.0–1.0)."""
-    print(f"\n{'─'*60}")
-    print(f"  TASK: {task_id}")
-    print(f"{'─'*60}")
-
     final_score = 0.0
+    print(f"[START] task_id={task_id}")
     try:
-        # ── Reset ────────────────────────────────────────────────────────────────
         data = env_post("/reset", params={"task_id": task_id})
         session_id = data.get("session_id")
         obs = data.get("observation")
         if not session_id or not obs:
-            print(f"  ERROR: Invalid reset response for {task_id}")
+            print(f"[END] task_id={task_id} score=0.0")
             return 0.0
 
         conversation: list = []
@@ -144,7 +132,6 @@ def run_episode(task_id: str) -> float:
             if obs.get("done"):
                 break
 
-            # Build user message from current observation
             user_msg = (
                 f"TASK:\n{obs.get('task_description', 'No description')}\n\n"
                 f"Available tables: {obs.get('available_tables', [])}\n"
@@ -157,62 +144,44 @@ def run_episode(task_id: str) -> float:
 
             conversation.append({"role": "user", "content": user_msg})
 
-            # ── LLM decision ─────────────────────────────────────────────────────
             try:
                 llm_text = call_llm(conversation)
-            except Exception as exc:
-                print(f"  [step {step_num}] LLM error: {exc}")
+            except Exception:
                 llm_text = json.dumps({"action_type": "submit_solution", "sql": "SELECT 1"})
 
             conversation.append({"role": "assistant", "content": llm_text})
             action = parse_action(llm_text)
 
             action_label = action.get("action_type", "?")
-            action_detail = action.get("table_name") or (action.get("sql", "")[:60])
-            print(f"  [step {step_num}] {action_label}: {action_detail!r}")
+            action_detail = (action.get("table_name") or action.get("sql", "")[:60]).replace("\n", " ")
+            print(f"[STEP] step={step_num} action={action_label} detail={action_detail!r}")
 
-            # ── Send action ───────────────────────────────────────────────────────
             try:
                 step_data = env_post(f"/step/{session_id}", json=action)
-            except Exception as exc:
-                print(f"  [step {step_num}] Environment error: {exc}")
+            except Exception:
                 break
 
             obs = step_data.get("observation", {})
             reward = step_data.get("reward", {})
             reward_val = reward.get("value", 0.0)
-            reward_msg = reward.get("reason", "")[:70]
-            print(f"           reward={reward_val:+.4f}  msg={reward_msg!r}")
+            reward_msg = reward.get("reason", "").replace("\n", " ")[:70]
+            print(f"[REWARD] value={reward_val} reason={reward_msg!r}")
 
             if step_data.get("done"):
                 info = step_data.get("info") or {}
                 final_score = info.get("score", 0.0)
-                print(f"\n  ✓ Episode finished.  SCORE = {final_score:.4f}")
-                if "grading_details" in info and isinstance(info["grading_details"], dict):
-                    for k, v in info["grading_details"].items():
-                        print(f"    {k}: {v}")
                 break
-    except Exception as exc:
-        print(f"  ERROR: Episode crashed for {task_id}: {exc}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        pass
 
+    print(f"[END] task_id={task_id} score={final_score}")
     return final_score
 
 
 def main() -> None:
-    print("=" * 60)
-    print("  SQL Debug OpenEnv — Baseline Evaluation")
-    print(f"  ENV  : {ENV_BASE_URL}")
-    print(f"  MODEL: {MODEL_NAME}")
-    print("=" * 60)
-
-    # Verify server is up
     try:
-        health = env_get("/health")
-        print(f"  Server health: {health}")
-    except Exception as exc:
-        print(f"ERROR: Cannot reach environment at {ENV_BASE_URL}\n  {exc}")
+        env_get("/health")
+    except Exception:
         sys.exit(1)
 
     tasks = ["fix_broken_query", "write_business_query", "complex_analytics"]
@@ -224,22 +193,12 @@ def main() -> None:
         scores[task_id] = score
 
     elapsed = time.time() - t0
-
-    print("\n" + "=" * 60)
-    print("  FINAL SCORES")
-    print("=" * 60)
-    for tid, s in scores.items():
-        bar = "█" * int(s * 20) + "░" * (20 - int(s * 20))
-        print(f"  {tid:<28} {s:.4f}  [{bar}]")
     avg = sum(scores.values()) / len(scores)
-    print(f"\n  Average score: {avg:.4f}")
-    print(f"  Total time:    {elapsed:.1f}s")
-    print("=" * 60)
 
-    # Persist scores
+    print(f"[SUMMARY] avg_score={avg} elapsed={elapsed:.1f}s")
+
     with open("baseline_scores.json", "w") as fh:
         json.dump({"scores": scores, "average": avg, "elapsed_seconds": elapsed}, fh, indent=2)
-    print("\n  Scores saved to baseline_scores.json")
 
 
 if __name__ == "__main__":

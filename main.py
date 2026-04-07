@@ -84,7 +84,7 @@ async def step(session_id: str, action: Action):
         # Record to leaderboard if it was a submission with a score
         score = result.info.get("score")
         if score is not None:
-            task_id = env.state().task_id if not result.done else result.observation.task_id
+            task_id = result.observation.task_id
             entry = {
                 "score": score,
                 "steps": result.observation.step_count,
