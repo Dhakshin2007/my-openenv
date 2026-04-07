@@ -82,32 +82,42 @@ def run_sql(sql: str, action_type: str, session_id: str, stats: str) -> tuple:
     info = result.info
 
     # Format output
-    if action_type == "submit_solution":
+    if info.get("safety_violation"):
+        out = f"🛡️ SECURITY ALERT\n\n{obs.message}\n\nAction blocked for safety."
+    elif action_type == "submit_solution":
         score = info.get("score", 0.0)
         gd    = info.get("grading_details", {})
         bar   = "█" * int(score * 20) + "░" * (20 - int(score * 20))
         out   = f"🏁 SUBMISSION GRADED\n\nScore: {score:.4f}  [{bar}]\n\n"
         out  += "\n".join(f"  {k}: {v}" for k, v in gd.items())
+        if info.get("performance_hint"):
+            out += f"\n\nOracle: {info['performance_hint']}"
         if info.get("result_preview"):
             out += "\n\nResult preview:\n" + _fmt_result(info["result_preview"])
     elif obs.last_error:
         out = _fmt_result([], obs.last_error)
     elif obs.last_result:
         r = obs.last_result
+        perf = info.get("performance_hint", "")
+        if perf:
+            out = f"Oracle: {perf}\n\n"
+        else:
+            out = ""
+            
         if isinstance(r, list):
-            out = _fmt_result(r)
+            out += _fmt_result(r)
         elif isinstance(r, dict):
             # schema info
             cols_info = r.get("columns", [])
             sample    = r.get("sample_rows", [])
             cnt       = r.get("row_count", "?")
-            out  = f"📊 Schema ({cnt} rows):\n"
+            out  += f"📊 Schema ({cnt} rows):\n"
             if cols_info:
                 out += _fmt_result(cols_info)
             if sample:
                 out += f"\nSample rows:\n{_fmt_result(sample)}"
         else:
-            out = str(r)
+            out += str(r)
     else:
         out = rew.reason
 

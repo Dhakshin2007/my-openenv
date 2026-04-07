@@ -69,7 +69,12 @@ def call_llm(messages: list) -> str:
         temperature=0.0,
         max_tokens=512,
     )
-    return response.choices[0].message.content.strip()
+    if not response.choices:
+        raise ValueError("LLM returned no choices")
+    content = response.choices[0].message.content
+    if content is None:
+        return json.dumps({"action_type": "submit_solution", "sql": "SELECT 'no_content' AS error"})
+    return content.strip()
 
 
 def parse_action(text: str) -> dict:
@@ -97,16 +102,24 @@ def parse_action(text: str) -> dict:
 
 def env_post(path: str, **kwargs) -> dict:
     url = f"{ENV_BASE_URL}{path}"
-    r = requests.post(url, timeout=30, **kwargs)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(url, timeout=30, **kwargs)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        print(f"  [env_post] Error at {path}: {exc}")
+        raise
 
 
 def env_get(path: str) -> dict:
     url = f"{ENV_BASE_URL}{path}"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        print(f"  [env_get] Error at {path}: {exc}")
+        raise
 
 
 def run_episode(task_id: str) -> float:
@@ -115,64 +128,74 @@ def run_episode(task_id: str) -> float:
     print(f"  TASK: {task_id}")
     print(f"{'─'*60}")
 
-    # ── Reset ────────────────────────────────────────────────────────────────
-    data = env_post("/reset", params={"task_id": task_id})
-    session_id = data["session_id"]
-    obs = data["observation"]
-
-    conversation: list = []
     final_score = 0.0
+    try:
+        # ── Reset ────────────────────────────────────────────────────────────────
+        data = env_post("/reset", params={"task_id": task_id})
+        session_id = data.get("session_id")
+        obs = data.get("observation")
+        if not session_id or not obs:
+            print(f"  ERROR: Invalid reset response for {task_id}")
+            return 0.0
 
-    for step_num in range(1, MAX_EPISODE_STEPS + 1):
-        if obs.get("done"):
-            break
+        conversation: list = []
 
-        # Build user message from current observation
-        user_msg = (
-            f"TASK:\n{obs['task_description']}\n\n"
-            f"Available tables: {obs['available_tables']}\n"
-            f"Step: {obs['step_count']} / 25\n"
-            f"Last result: {json.dumps(obs.get('last_result'), default=str)[:600]}\n"
-            f"Last error: {obs.get('last_error') or 'none'}\n"
-            f"Recent history: {json.dumps(obs.get('query_history', [])[-3:])}\n\n"
-            "What is your next action? (JSON only)"
-        )
+        for step_num in range(1, MAX_EPISODE_STEPS + 1):
+            if obs.get("done"):
+                break
 
-        conversation.append({"role": "user", "content": user_msg})
+            # Build user message from current observation
+            user_msg = (
+                f"TASK:\n{obs.get('task_description', 'No description')}\n\n"
+                f"Available tables: {obs.get('available_tables', [])}\n"
+                f"Step: {obs.get('step_count', 0)} / 25\n"
+                f"Last result: {json.dumps(obs.get('last_result'), default=str)[:600]}\n"
+                f"Last error: {obs.get('last_error') or 'none'}\n"
+                f"Recent history: {json.dumps(obs.get('query_history', [])[-3:])}\n\n"
+                "What is your next action? (JSON only)"
+            )
 
-        # ── LLM decision ─────────────────────────────────────────────────────
-        try:
-            llm_text = call_llm(conversation)
-        except Exception as exc:
-            print(f"  [step {step_num}] LLM error: {exc}")
-            llm_text = json.dumps({"action_type": "submit_solution", "sql": "SELECT 1"})
+            conversation.append({"role": "user", "content": user_msg})
 
-        conversation.append({"role": "assistant", "content": llm_text})
-        action = parse_action(llm_text)
+            # ── LLM decision ─────────────────────────────────────────────────────
+            try:
+                llm_text = call_llm(conversation)
+            except Exception as exc:
+                print(f"  [step {step_num}] LLM error: {exc}")
+                llm_text = json.dumps({"action_type": "submit_solution", "sql": "SELECT 1"})
 
-        action_label = action.get("action_type", "?")
-        action_detail = action.get("table_name") or (action.get("sql", "")[:60])
-        print(f"  [step {step_num}] {action_label}: {action_detail!r}")
+            conversation.append({"role": "assistant", "content": llm_text})
+            action = parse_action(llm_text)
 
-        # ── Send action ───────────────────────────────────────────────────────
-        try:
-            step_data = env_post(f"/step/{session_id}", json=action)
-        except requests.HTTPError as exc:
-            print(f"  [step {step_num}] HTTP error: {exc}")
-            break
+            action_label = action.get("action_type", "?")
+            action_detail = action.get("table_name") or (action.get("sql", "")[:60])
+            print(f"  [step {step_num}] {action_label}: {action_detail!r}")
 
-        obs = step_data["observation"]
-        reward = step_data["reward"]
-        print(f"           reward={reward['value']:+.4f}  msg={reward['reason'][:70]!r}")
+            # ── Send action ───────────────────────────────────────────────────────
+            try:
+                step_data = env_post(f"/step/{session_id}", json=action)
+            except Exception as exc:
+                print(f"  [step {step_num}] Environment error: {exc}")
+                break
 
-        if step_data.get("done"):
-            info = step_data.get("info", {})
-            final_score = info.get("score", 0.0)
-            print(f"\n  ✓ Episode finished.  SCORE = {final_score:.4f}")
-            if "grading_details" in info:
-                for k, v in info["grading_details"].items():
-                    print(f"    {k}: {v}")
-            break
+            obs = step_data.get("observation", {})
+            reward = step_data.get("reward", {})
+            reward_val = reward.get("value", 0.0)
+            reward_msg = reward.get("reason", "")[:70]
+            print(f"           reward={reward_val:+.4f}  msg={reward_msg!r}")
+
+            if step_data.get("done"):
+                info = step_data.get("info") or {}
+                final_score = info.get("score", 0.0)
+                print(f"\n  ✓ Episode finished.  SCORE = {final_score:.4f}")
+                if "grading_details" in info and isinstance(info["grading_details"], dict):
+                    for k, v in info["grading_details"].items():
+                        print(f"    {k}: {v}")
+                break
+    except Exception as exc:
+        print(f"  ERROR: Episode crashed for {task_id}: {exc}")
+        import traceback
+        traceback.print_exc()
 
     return final_score
 
