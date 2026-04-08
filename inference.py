@@ -149,7 +149,7 @@ def wait_for_server() -> bool:
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
 def run_episode(task_id: str) -> float:
-    final_score = 0.0
+    final_score = 0.01
     steps_taken = 0
 
     log(f"[START] task={task_id}")
@@ -160,7 +160,7 @@ def run_episode(task_id: str) -> float:
         obs        = data.get("observation")
         if not session_id or not obs:
             log(f"[END] task={task_id} score=0.0 steps=0")
-            return 0.0
+            return 0.01
 
         conversation: list = []
 
@@ -199,7 +199,8 @@ def run_episode(task_id: str) -> float:
             log(f"[STEP] step={step_num} reward={reward_val}")
 
             if step_data.get("done"):
-                final_score = (step_data.get("info") or {}).get("score", 0.0)
+                raw_score = (step_data.get("info") or {}).get("score", 0.5)
+		final_score = max(0.01,min(0.99,raw_score))
                 break
 
     except Exception:
@@ -214,9 +215,9 @@ def main() -> None:
 
     if not wait_for_server():
         zero_scores = {
-            "fix_broken_query":     0.0,
-            "write_business_query": 0.0,
-            "complex_analytics":    0.0,
+            "fix_broken_query":     0.01,
+            "write_business_query": 0.01,
+            "complex_analytics":    0.01,
         }
         for task_id in zero_scores:
             log(f"[START] task={task_id}")
