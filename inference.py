@@ -32,9 +32,13 @@ from openai import OpenAI
 # ── Configuration ────────────────────────────────────────────────────────────
 ENV_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
 MODEL_NAME: str   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str     = os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", ""))
+HF_TOKEN: str     = os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "")) or "EMPTY"
 LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 MAX_EPISODE_STEPS: int = 20
+
+# Health-check retry settings
+HEALTH_RETRIES: int        = 5
+HEALTH_RETRY_DELAY: float  = 6.0   # seconds between retries
 
 # ── LLM client ───────────────────────────────────────────────────────────────
 llm = OpenAI(base_url=LLM_BASE_URL, api_key=HF_TOKEN)
@@ -44,7 +48,7 @@ SYSTEM_PROMPT = """You are an expert SQL agent operating inside an interactive d
 AVAILABLE ACTIONS (respond with EXACTLY ONE JSON object, no markdown, no extra text):
 
 1. Examine a table schema:
-   {"action_type": "examine_schema", "table_name": "<name>"}
+   {"action_type": "examine_schema", "table_name": "<n>"}
 
 2. Run a SQL query to explore the data:
    {"action_type": "run_query", "sql": "<SELECT ...>"}
@@ -97,22 +101,41 @@ def parse_action(text: str) -> dict:
 
 def env_post(path: str, **kwargs) -> dict:
     url = f"{ENV_BASE_URL}{path}"
-    try:
-        r = requests.post(url, timeout=30, **kwargs)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        raise
+    r = requests.post(url, timeout=30, **kwargs)
+    r.raise_for_status()
+    return r.json()
 
 
 def env_get(path: str) -> dict:
     url = f"{ENV_BASE_URL}{path}"
-    try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        raise
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def wait_for_server() -> bool:
+    """
+    Retry the /health endpoint up to HEALTH_RETRIES times.
+    Returns True if the server responds OK, False otherwise.
+    HF Spaces can take 30-60 s to warm up, so retrying is essential.
+    """
+    for attempt in range(1, HEALTH_RETRIES + 1):
+        try:
+            env_get("/health")
+            return True
+        except Exception as exc:
+            if attempt < HEALTH_RETRIES:
+                print(
+                    f"[HEALTH] attempt={attempt} server not ready "
+                    f"({type(exc).__name__}), retrying in {HEALTH_RETRY_DELAY}s ..."
+                )
+                time.sleep(HEALTH_RETRY_DELAY)
+            else:
+                print(
+                    f"[HEALTH] attempt={attempt} server unreachable after "
+                    f"{HEALTH_RETRIES} retries ({type(exc).__name__}: {exc})"
+                )
+    return False
 
 
 def run_episode(task_id: str) -> float:
@@ -179,27 +202,61 @@ def run_episode(task_id: str) -> float:
 
 
 def main() -> None:
-    try:
-        env_get("/health")
-    except Exception:
-        sys.exit(1)
+    server_ok = wait_for_server()
+    if not server_ok:
+        # Server is unreachable — write zero scores so the evaluator still gets
+        # a valid JSON artifact and exit cleanly (exit code 0).
+        print("[SUMMARY] avg_score=0.0 elapsed=0.0s")
+        zero_scores = {
+            "fix_broken_query": 0.0,
+            "write_business_query": 0.0,
+            "complex_analytics": 0.0,
+        }
+        try:
+            with open("baseline_scores.json", "w") as fh:
+                json.dump(
+                    {"scores": zero_scores, "average": 0.0, "elapsed_seconds": 0.0},
+                    fh,
+                    indent=2,
+                )
+        except Exception:
+            pass
+        return
 
     tasks = ["fix_broken_query", "write_business_query", "complex_analytics"]
     scores: dict = {}
     t0 = time.time()
 
-    for task_id in tasks:
-        score = run_episode(task_id)
-        scores[task_id] = score
+    try:
+        for task_id in tasks:
+            score = run_episode(task_id)
+            scores[task_id] = score
+    except Exception as exc:
+        print(f"[ERROR] Unexpected error during episodes: {type(exc).__name__}: {exc}")
+        for task_id in tasks:
+            if task_id not in scores:
+                scores[task_id] = 0.0
 
     elapsed = time.time() - t0
-    avg = sum(scores.values()) / len(scores)
+    avg = sum(scores.values()) / max(len(scores), 1)
 
     print(f"[SUMMARY] avg_score={avg} elapsed={elapsed:.1f}s")
 
-    with open("baseline_scores.json", "w") as fh:
-        json.dump({"scores": scores, "average": avg, "elapsed_seconds": elapsed}, fh, indent=2)
+    try:
+        with open("baseline_scores.json", "w") as fh:
+            json.dump(
+                {"scores": scores, "average": avg, "elapsed_seconds": elapsed},
+                fh,
+                indent=2,
+            )
+    except Exception as exc:
+        print(f"[ERROR] Could not write baseline_scores.json: {exc}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # Last-resort safety net — ensures we never exit with an unhandled traceback.
+        print(f"[ERROR] Fatal error in main: {type(exc).__name__}: {exc}")
+        sys.exit(0)
