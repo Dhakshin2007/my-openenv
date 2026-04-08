@@ -2,23 +2,23 @@
 inference.py — Baseline agent for SQL Debug Environment.
 
 Usage:
-  export API_BASE_URL=https://<your-hf-space>.hf.space
-  export MODEL_NAME=meta-llama/Llama-3.1-70B-Instruct
-  export HF_TOKEN=hf_...
-  python inference.py
+export API_BASE_URL=https://<your-env>.hf.space
+export MODEL_NAME=meta-llama/Llama-3.1-70B-Instruct
+export API_KEY=<key-injected-by-scaler>
+python inference.py
 
 The agent:
-  1. Calls POST /reset to start an episode.
-  2. Uses the LLM to decide actions (examine_schema → run_query → submit_solution).
-  3. Collects the grader score from the step result.
-  4. Repeats for all 3 tasks and prints a summary.
+1. Calls POST /reset to start an episode.
+2. Uses the LLM to decide actions (examine_schema → run_query → submit_solution).
+3. Collects the grader score from the step result.
+4. Repeats for all 3 tasks and prints a summary.
 
 Environment variables:
-  API_BASE_URL   URL of the deployed OpenEnv server (default: http://localhost:7860)
-  MODEL_NAME     LLM model identifier (default: gpt-4o-mini)
-  HF_TOKEN       Hugging Face / OpenAI API key
-  LLM_BASE_URL   Base URL for the OpenAI-compatible LLM API
-                 (default: https://api.openai.com/v1)
+API_BASE_URL   URL of the deployed OpenEnv server (default: http://localhost:7860)
+MODEL_NAME     LLM model identifier (default: gpt-4o-mini)
+API_KEY        LLM API key injected by the Scaler evaluator
+LLM_BASE_URL   Base URL for the OpenAI-compatible LLM proxy
+               (default: same as API_BASE_URL + /v1)
 """
 
 import json
@@ -33,59 +33,40 @@ from openai import OpenAI
 # ── Configuration ────────────────────────────────────────────────────────────
 ENV_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
 MODEL_NAME: str   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str     = os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "")) or "EMPTY"
-LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-MAX_EPISODE_STEPS: int = 20
+# Scaler injects API_KEY; fall back to HF_TOKEN / OPENAI_API_KEY for local runs
+API_KEY: str      = (
+    os.getenv("API_KEY")
+    or os.getenv("HF_TOKEN")
+    or os.getenv("OPENAI_API_KEY")
+    or "EMPTY"
+)
+# Scaler also injects LLM_BASE_URL (their LiteLLM proxy).
+# Fall back to ENV_BASE_URL/v1 so local runs still work.
+LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", f"{ENV_BASE_URL}/v1")
 
-# Health-check retry settings
-HEALTH_RETRIES: int       = 10
-HEALTH_RETRY_DELAY: float = 5.0  # seconds between retries
+MAX_EPISODE_STEPS: int  = 20
+HEALTH_RETRIES: int     = 10
+HEALTH_RETRY_DELAY: float = 5.0
 
-# ── Logging helper (flush=True is required by the hackathon evaluator) ────────
+# ── Logging helper ────────────────────────────────────────────────────────────
 def log(msg: str) -> None:
     print(msg, flush=True)
 
-# ── Auto-start server ─────────────────────────────────────────────────────────
-_server_process = None
-
-def start_server_if_needed() -> None:
-    """Launch main.py as a background process if the server is not already running."""
-    global _server_process
-    try:
-        r = requests.get(f"{ENV_BASE_URL}/health", timeout=3)
-        if r.status_code == 200:
-            log("[SERVER] Already running — skipping auto-start.")
-            return
-    except Exception:
-        pass  # Not running yet — start it
-
-    server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
-    if not os.path.exists(server_script):
-        log("[SERVER] main.py not found — skipping auto-start.")
-        return
-
-    log("[SERVER] Starting main.py in the background ...")
-    _server_process = subprocess.Popen(
-        [sys.executable, server_script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-# ── LLM client ───────────────────────────────────────────────────────────────
-llm = OpenAI(base_url=LLM_BASE_URL, api_key=HF_TOKEN)
+# ── LLM client (uses Scaler proxy when running under the evaluator) ───────────
+llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
 
 SYSTEM_PROMPT = """You are an expert SQL agent operating inside an interactive database environment.
 
 AVAILABLE ACTIONS (respond with EXACTLY ONE JSON object, no markdown, no extra text):
 
 1. Examine a table schema:
-   {"action_type": "examine_schema", "table_name": "<n>"}
+{"action_type": "examine_schema", "table_name": ""}
 
 2. Run a SQL query to explore the data:
-   {"action_type": "run_query", "sql": "<SELECT ...>"}
+{"action_type": "run_query", "sql": ""}
 
 3. Submit your final answer:
-   {"action_type": "submit_solution", "sql": "<corrected/written SQL>"}
+{"action_type": "submit_solution", "sql": ""}
 
 STRATEGY:
 - First examine ALL available tables to understand the schema.
@@ -94,7 +75,6 @@ STRATEGY:
 - Be efficient: aim to solve tasks in ≤10 steps.
 - Think carefully about the task requirements before submitting.
 """
-
 
 def call_llm(messages: list) -> str:
     response = llm.chat.completions.create(
@@ -110,7 +90,6 @@ def call_llm(messages: list) -> str:
         return json.dumps({"action_type": "submit_solution", "sql": "SELECT 'no_content' AS error"})
     return content.strip()
 
-
 def parse_action(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
@@ -121,7 +100,7 @@ def parse_action(text: str) -> dict:
         return json.loads(text)
     except json.JSONDecodeError:
         start = text.find("{")
-        end = text.rfind("}") + 1
+        end   = text.rfind("}") + 1
         if start != -1 and end > start:
             try:
                 return json.loads(text[start:end])
@@ -129,13 +108,12 @@ def parse_action(text: str) -> dict:
                 pass
     return {"action_type": "submit_solution", "sql": "SELECT 'parse_error' AS error"}
 
-
+# ── Environment helpers ───────────────────────────────────────────────────────
 def env_post(path: str, **kwargs) -> dict:
     url = f"{ENV_BASE_URL}{path}"
     r = requests.post(url, timeout=30, **kwargs)
     r.raise_for_status()
     return r.json()
-
 
 def env_get(path: str) -> dict:
     url = f"{ENV_BASE_URL}{path}"
@@ -143,13 +121,32 @@ def env_get(path: str) -> dict:
     r.raise_for_status()
     return r.json()
 
+# ── Auto-start server ─────────────────────────────────────────────────────────
+_server_process = None
+
+def start_server_if_needed() -> None:
+    global _server_process
+    try:
+        r = requests.get(f"{ENV_BASE_URL}/health", timeout=3)
+        if r.status_code == 200:
+            log("[SERVER] Already running — skipping auto-start.")
+            return
+    except Exception:
+        pass
+
+    server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+    if not os.path.exists(server_script):
+        log("[SERVER] main.py not found — skipping auto-start.")
+        return
+
+    log("[SERVER] Starting main.py in the background ...")
+    _server_process = subprocess.Popen(
+        [sys.executable, server_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 def wait_for_server() -> bool:
-    """
-    Retry the /health endpoint up to HEALTH_RETRIES times.
-    Returns True if the server responds OK, False otherwise.
-    HF Spaces can take 30-60 s to warm up, so retrying is essential.
-    """
     for attempt in range(1, HEALTH_RETRIES + 1):
         try:
             env_get("/health")
@@ -168,18 +165,17 @@ def wait_for_server() -> bool:
                 )
     return False
 
-
+# ── Episode runner ────────────────────────────────────────────────────────────
 def run_episode(task_id: str) -> float:
     final_score = 0.0
     steps_taken = 0
 
-    # ── Required structured output — evaluator looks for this exact format ──
     log(f"[START] task={task_id}")
 
     try:
         data = env_post("/reset", params={"task_id": task_id})
         session_id = data.get("session_id")
-        obs = data.get("observation")
+        obs        = data.get("observation")
         if not session_id or not obs:
             log(f"[END] task={task_id} score=0.0 steps=0")
             return 0.0
@@ -215,12 +211,11 @@ def run_episode(task_id: str) -> float:
             except Exception:
                 break
 
-            obs = step_data.get("observation", {})
-            reward = step_data.get("reward", {})
+            obs       = step_data.get("observation", {})
+            reward    = step_data.get("reward", {})
             reward_val = reward.get("value", 0.0)
             steps_taken = step_num
 
-            # ── Required structured output ──
             log(f"[STEP] step={step_num} reward={reward_val}")
 
             if step_data.get("done"):
@@ -231,21 +226,19 @@ def run_episode(task_id: str) -> float:
     except Exception:
         pass
 
-    # ── Required structured output ──
     log(f"[END] task={task_id} score={final_score} steps={steps_taken}")
     return final_score
 
-
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     start_server_if_needed()
     server_ok = wait_for_server()
 
     if not server_ok:
-        # Server unreachable — emit required blocks with zeros and exit cleanly
         zero_scores = {
-            "fix_broken_query": 0.0,
+            "fix_broken_query":    0.0,
             "write_business_query": 0.0,
-            "complex_analytics": 0.0,
+            "complex_analytics":   0.0,
         }
         for task_id in zero_scores:
             log(f"[START] task={task_id}")
@@ -254,10 +247,7 @@ def main() -> None:
         log("[SUMMARY] avg_score=0.0 elapsed=0.0s")
         try:
             with open("baseline_scores.json", "w") as fh:
-                json.dump(
-                    {"scores": zero_scores, "average": 0.0, "elapsed_seconds": 0.0},
-                    fh, indent=2,
-                )
+                json.dump({"scores": zero_scores, "average": 0.0, "elapsed_seconds": 0.0}, fh, indent=2)
         except Exception:
             pass
         return
@@ -268,8 +258,7 @@ def main() -> None:
 
     try:
         for task_id in tasks:
-            score = run_episode(task_id)
-            scores[task_id] = score
+            scores[task_id] = run_episode(task_id)
     except Exception as exc:
         log(f"[ERROR] Unexpected error during episodes: {type(exc).__name__}: {exc}")
         for task_id in tasks:
@@ -283,14 +272,10 @@ def main() -> None:
 
     try:
         with open("baseline_scores.json", "w") as fh:
-            json.dump(
-                {"scores": scores, "average": avg, "elapsed_seconds": elapsed},
-                fh, indent=2,
-            )
+            json.dump({"scores": scores, "average": avg, "elapsed_seconds": elapsed}, fh, indent=2)
     except Exception as exc:
         log(f"[ERROR] Could not write baseline_scores.json: {exc}")
 
-    # Stop the server if we auto-started it
     if _server_process is not None:
         log("[SERVER] Shutting down background server ...")
         _server_process.terminate()
@@ -300,6 +285,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        # Last-resort safety net — never exit with an unhandled traceback
         print(f"[ERROR] Fatal error in main: {type(exc).__name__}: {exc}", flush=True)
         sys.exit(0)
