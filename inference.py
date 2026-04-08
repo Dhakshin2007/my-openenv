@@ -30,7 +30,7 @@ API_KEY: str = (
 )
 
 # The OpenEnv server base (for /reset, /step, /health)
-ENV_BASE_URL: str = API_BASE_URL
+ENV_BASE_URL: str = "http://localhost:7860"  # ← always the local env server
 
 # The LLM proxy base — Scaler routes LLM calls through API_BASE_URL/v1
 LLM_BASE_URL: str = API_BASE_URL if API_BASE_URL.endswith("/v1") else API_BASE_URL + "/v1"
