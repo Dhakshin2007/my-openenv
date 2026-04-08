@@ -1,12 +1,3 @@
-"""
-inference.py — Baseline agent for SQL Debug Environment.
-
-Environment variables injected by the Scaler evaluator:
-  API_BASE_URL   Base URL for the LiteLLM proxy  (MUST be used as OpenAI base_url)
-  API_KEY        API key for the LiteLLM proxy    (MUST be used as OpenAI api_key)
-  MODEL_NAME     LLM model identifier
-"""
-
 import json
 import os
 import subprocess
@@ -16,12 +7,10 @@ import time
 import requests
 from openai import OpenAI
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-# Scaler injects API_BASE_URL — this is BOTH the env server AND the LLM proxy base.
+# Configuration
 API_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:7860").rstrip("/")
-MODEL_NAME: str   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+MODEL_NAME: str = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 
-# Scaler injects API_KEY for the LiteLLM proxy. HF_TOKEN is a local fallback only.
 API_KEY: str = (
     os.environ.get("API_KEY")
     or os.environ.get("HF_TOKEN")
@@ -29,21 +18,20 @@ API_KEY: str = (
     or "EMPTY"
 )
 
-# The OpenEnv server base (for /reset, /step, /health)
-ENV_BASE_URL: str = "http://localhost:7860"  # ← always the local env server
-
-# The LLM proxy base — Scaler routes LLM calls through API_BASE_URL/v1
+ENV_BASE_URL: str = "http://localhost:7860"
 LLM_BASE_URL: str = API_BASE_URL if API_BASE_URL.endswith("/v1") else API_BASE_URL + "/v1"
 
-MAX_EPISODE_STEPS: int    = 20
-HEALTH_RETRIES: int       = 10
+MAX_EPISODE_STEPS: int = 20
+HEALTH_RETRIES: int = 10
 HEALTH_RETRY_DELAY: float = 5.0
 
-# ── Logging helper ─────────────────────────────────────────────────────────────
+
+# Simple logger
 def log(msg: str) -> None:
     print(msg, flush=True)
 
-# ── LLM client — uses Scaler's injected API_BASE_URL + API_KEY ────────────────
+
+# LLM client
 llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
 
 SYSTEM_PROMPT = """You are an expert SQL agent operating inside an interactive database environment.
@@ -64,8 +52,8 @@ STRATEGY:
 - Run test queries to validate your understanding.
 - Once confident, submit your solution.
 - Be efficient: aim to solve tasks in <=10 steps.
-- Think carefully about the task requirements before submitting.
 """
+
 
 def call_llm(messages: list) -> str:
     response = llm.chat.completions.create(
@@ -74,80 +62,95 @@ def call_llm(messages: list) -> str:
         temperature=0.0,
         max_tokens=512,
     )
+
     if not response.choices:
         raise ValueError("LLM returned no choices")
+
     content = response.choices[0].message.content
+
     if content is None:
         return json.dumps({"action_type": "submit_solution", "sql": "SELECT 'no_content' AS error"})
+
     return content.strip()
+
 
 def parse_action(text: str) -> dict:
     text = text.strip()
+
     if text.startswith("```"):
         lines = text.splitlines()
         inner = [l for l in lines if not l.startswith("```")]
         text = "\n".join(inner).strip()
+
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         start = text.find("{")
-        end   = text.rfind("}") + 1
+        end = text.rfind("}") + 1
+
         if start != -1 and end > start:
             try:
                 return json.loads(text[start:end])
             except json.JSONDecodeError:
                 pass
+
     return {"action_type": "submit_solution", "sql": "SELECT 'parse_error' AS error"}
 
-# ── Environment helpers ────────────────────────────────────────────────────────
+
+# Environment helpers
 def env_post(path: str, **kwargs) -> dict:
     r = requests.post(f"{ENV_BASE_URL}{path}", timeout=30, **kwargs)
     r.raise_for_status()
     return r.json()
+
 
 def env_get(path: str) -> dict:
     r = requests.get(f"{ENV_BASE_URL}{path}", timeout=30)
     r.raise_for_status()
     return r.json()
 
-# ── Auto-start server ─────────────────────────────────────────────────────────
+
+# Server handling
 _server_process = None
+
 
 def start_server_if_needed() -> None:
     global _server_process
+
     try:
         if requests.get(f"{ENV_BASE_URL}/health", timeout=3).status_code == 200:
-            log("[SERVER] Already running — skipping auto-start.")
+            log("[SERVER] Already running")
             return
     except Exception:
         pass
 
     server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+
     if not os.path.exists(server_script):
-        log("[SERVER] main.py not found — skipping auto-start.")
+        log("[SERVER] main.py not found")
         return
 
-    log("[SERVER] Starting main.py in the background ...")
+    log("[SERVER] Starting main.py")
     _server_process = subprocess.Popen(
         [sys.executable, server_script],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
+
 def wait_for_server() -> bool:
     for attempt in range(1, HEALTH_RETRIES + 1):
         try:
             env_get("/health")
             return True
-        except Exception as exc:
+        except Exception:
             if attempt < HEALTH_RETRIES:
-                log(f"[HEALTH] attempt={attempt} server not ready ({type(exc).__name__}), retrying in {HEALTH_RETRY_DELAY}s ...")
                 time.sleep(HEALTH_RETRY_DELAY)
-            else:
-                log(f"[HEALTH] attempt={attempt} server unreachable after {HEALTH_RETRIES} retries ({type(exc).__name__}: {exc})")
+
     return False
 
-# ── Episode runner ─────────────────────────────────────────────────────────────
+
+# Run one task
 def run_episode(task_id: str) -> float:
     final_score = 0.01
     steps_taken = 0
@@ -157,9 +160,10 @@ def run_episode(task_id: str) -> float:
     try:
         data = env_post("/reset", params={"task_id": task_id})
         session_id = data.get("session_id")
-        obs        = data.get("observation")
+        obs = data.get("observation")
+
         if not session_id or not obs:
-            log(f"[END] task={task_id} score=0.0 steps=0")
+            log(f"[END] task={task_id} score=0.01 steps=0")
             return 0.01
 
         conversation: list = []
@@ -177,6 +181,7 @@ def run_episode(task_id: str) -> float:
                 f"Recent history: {json.dumps(obs.get('query_history', [])[-3:])}\n\n"
                 "What is your next action? (JSON only)"
             )
+
             conversation.append({"role": "user", "content": user_msg})
 
             try:
@@ -192,7 +197,7 @@ def run_episode(task_id: str) -> float:
             except Exception:
                 break
 
-            obs        = step_data.get("observation", {})
+            obs = step_data.get("observation", {})
             reward_val = step_data.get("reward", {}).get("value", 0.0)
             steps_taken = step_num
 
@@ -200,62 +205,70 @@ def run_episode(task_id: str) -> float:
 
             if step_data.get("done"):
                 raw_score = (step_data.get("info") or {}).get("score", 0.5)
-		final_score = max(0.01,min(0.99,raw_score))
+                final_score = max(0.01, min(0.99, raw_score))
                 break
 
     except Exception:
         pass
 
+    final_score = max(0.01, min(0.99, final_score))
     log(f"[END] task={task_id} score={final_score} steps={steps_taken}")
     return final_score
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+
+# Main execution
 def main() -> None:
     start_server_if_needed()
 
     if not wait_for_server():
-        zero_scores = {
-            "fix_broken_query":     0.01,
+        fallback_scores = {
+            "fix_broken_query": 0.01,
             "write_business_query": 0.01,
-            "complex_analytics":    0.01,
+            "complex_analytics": 0.01,
         }
-        for task_id in zero_scores:
+
+        for task_id in fallback_scores:
             log(f"[START] task={task_id}")
-            log(f"[STEP] step=0 reward=0.0")
-            log(f"[END] task={task_id} score=0.0 steps=0")
-        log("[SUMMARY] avg_score=0.0 elapsed=0.0s")
-        try:
-            with open("baseline_scores.json", "w") as fh:
-                json.dump({"scores": zero_scores, "average": 0.0, "elapsed_seconds": 0.0}, fh, indent=2)
-        except Exception:
-            pass
+            log(f"[STEP] step=0 reward=0.01")
+            log(f"[END] task={task_id} score=0.01 steps=0")
+
+        log("[SUMMARY] avg_score=0.01 elapsed=0.0s")
+
+        with open("baseline_scores.json", "w") as fh:
+            json.dump(
+                {"scores": fallback_scores, "average": 0.01, "elapsed_seconds": 0.0},
+                fh,
+                indent=2,
+            )
+
         return
 
-    tasks  = ["fix_broken_query", "write_business_query", "complex_analytics"]
+    tasks = ["fix_broken_query", "write_business_query", "complex_analytics"]
     scores: dict = {}
     t0 = time.time()
 
     try:
         for task_id in tasks:
             scores[task_id] = run_episode(task_id)
-    except Exception as exc:
-        log(f"[ERROR] Unexpected error during episodes: {type(exc).__name__}: {exc}")
+    except Exception:
         for task_id in tasks:
             if task_id not in scores:
-                scores[task_id] = 0.0
+                scores[task_id] = 0.01
 
     elapsed = time.time() - t0
     avg = sum(scores.values()) / max(len(scores), 1)
+
     log(f"[SUMMARY] avg_score={avg} elapsed={elapsed:.1f}s")
 
-    try:
-        with open("baseline_scores.json", "w") as fh:
-            json.dump({"scores": scores, "average": avg, "elapsed_seconds": elapsed}, fh, indent=2)
-    except Exception as exc:
-        log(f"[ERROR] Could not write baseline_scores.json: {exc}")
+    with open("baseline_scores.json", "w") as fh:
+        json.dump(
+            {"scores": scores, "average": avg, "elapsed_seconds": elapsed},
+            fh,
+            indent=2,
+        )
 
     if _server_process is not None:
-        log("[SERVER] Shutting down background server ...")
+        log("[SERVER] Shutting down")
         _server_process.terminate()
 
 
@@ -263,5 +276,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"[ERROR] Fatal error in main: {type(exc).__name__}: {exc}", flush=True)
+        print(f"[ERROR] Fatal error: {type(exc).__name__}: {exc}", flush=True)
         sys.exit(0)
