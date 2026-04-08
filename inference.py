@@ -3,8 +3,8 @@ inference.py — Baseline agent for SQL Debug Environment.
 
 Environment variables injected by the Scaler evaluator:
   API_BASE_URL   Base URL for the LiteLLM proxy  (MUST be used as OpenAI base_url)
+  API_KEY        API key for the LiteLLM proxy    (MUST be used as OpenAI api_key)
   MODEL_NAME     LLM model identifier
-  HF_TOKEN       API key for the LiteLLM proxy    (MUST be used as OpenAI api_key)
 """
 
 import json
@@ -16,32 +16,35 @@ import time
 import requests
 from openai import OpenAI
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 # Scaler injects API_BASE_URL — this is BOTH the env server AND the LLM proxy base.
-API_BASE_URL: str  = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
-MODEL_NAME: str    = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN: str      = os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "EMPTY")) or "EMPTY"
+API_BASE_URL: str = os.environ.get("API_BASE_URL", "http://localhost:7860").rstrip("/")
+MODEL_NAME: str   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
+
+# Scaler injects API_KEY for the LiteLLM proxy. HF_TOKEN is a local fallback only.
+API_KEY: str = (
+    os.environ.get("API_KEY")
+    or os.environ.get("HF_TOKEN")
+    or os.environ.get("OPENAI_API_KEY")
+    or "EMPTY"
+)
 
 # The OpenEnv server base (for /reset, /step, /health)
-ENV_BASE_URL: str  = API_BASE_URL
+ENV_BASE_URL: str = API_BASE_URL
 
-# The LLM proxy base — Scaler routes LLM calls through API_BASE_URL
-# We append /v1 only if the URL doesn't already end with /v1
-if API_BASE_URL.endswith("/v1"):
-    LLM_BASE_URL = API_BASE_URL
-else:
-    LLM_BASE_URL = API_BASE_URL + "/v1"
+# The LLM proxy base — Scaler routes LLM calls through API_BASE_URL/v1
+LLM_BASE_URL: str = API_BASE_URL if API_BASE_URL.endswith("/v1") else API_BASE_URL + "/v1"
 
 MAX_EPISODE_STEPS: int    = 20
 HEALTH_RETRIES: int       = 10
 HEALTH_RETRY_DELAY: float = 5.0
 
-# ── Logging helper ────────────────────────────────────────────────────────────
+# ── Logging helper ─────────────────────────────────────────────────────────────
 def log(msg: str) -> None:
     print(msg, flush=True)
 
-# ── LLM client — uses Scaler's injected API_BASE_URL + HF_TOKEN ──────────────
-llm = OpenAI(base_url=LLM_BASE_URL, api_key=HF_TOKEN)
+# ── LLM client — uses Scaler's injected API_BASE_URL + API_KEY ────────────────
+llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
 
 SYSTEM_PROMPT = """You are an expert SQL agent operating inside an interactive database environment.
 
@@ -96,7 +99,7 @@ def parse_action(text: str) -> dict:
                 pass
     return {"action_type": "submit_solution", "sql": "SELECT 'parse_error' AS error"}
 
-# ── Environment helpers ───────────────────────────────────────────────────────
+# ── Environment helpers ────────────────────────────────────────────────────────
 def env_post(path: str, **kwargs) -> dict:
     r = requests.post(f"{ENV_BASE_URL}{path}", timeout=30, **kwargs)
     r.raise_for_status()
@@ -144,7 +147,7 @@ def wait_for_server() -> bool:
                 log(f"[HEALTH] attempt={attempt} server unreachable after {HEALTH_RETRIES} retries ({type(exc).__name__}: {exc})")
     return False
 
-# ── Episode runner ────────────────────────────────────────────────────────────
+# ── Episode runner ─────────────────────────────────────────────────────────────
 def run_episode(task_id: str) -> float:
     final_score = 0.0
     steps_taken = 0
