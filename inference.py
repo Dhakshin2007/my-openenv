@@ -1,24 +1,10 @@
 """
 inference.py — Baseline agent for SQL Debug Environment.
 
-Usage:
-export API_BASE_URL=https://<your-env>.hf.space
-export MODEL_NAME=meta-llama/Llama-3.1-70B-Instruct
-export API_KEY=<key-injected-by-scaler>
-python inference.py
-
-The agent:
-1. Calls POST /reset to start an episode.
-2. Uses the LLM to decide actions (examine_schema → run_query → submit_solution).
-3. Collects the grader score from the step result.
-4. Repeats for all 3 tasks and prints a summary.
-
-Environment variables:
-API_BASE_URL   URL of the deployed OpenEnv server (default: http://localhost:7860)
-MODEL_NAME     LLM model identifier (default: gpt-4o-mini)
-API_KEY        LLM API key injected by the Scaler evaluator
-LLM_BASE_URL   Base URL for the OpenAI-compatible LLM proxy
-               (default: same as API_BASE_URL + /v1)
+Environment variables injected by the Scaler evaluator:
+  API_BASE_URL   Base URL for the LiteLLM proxy  (MUST be used as OpenAI base_url)
+  MODEL_NAME     LLM model identifier
+  HF_TOKEN       API key for the LiteLLM proxy    (MUST be used as OpenAI api_key)
 """
 
 import json
@@ -31,29 +17,31 @@ import requests
 from openai import OpenAI
 
 # ── Configuration ────────────────────────────────────────────────────────────
-ENV_BASE_URL: str = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
-MODEL_NAME: str   = os.getenv("MODEL_NAME", "gpt-4o-mini")
-# Scaler injects API_KEY; fall back to HF_TOKEN / OPENAI_API_KEY for local runs
-API_KEY: str      = (
-    os.getenv("API_KEY")
-    or os.getenv("HF_TOKEN")
-    or os.getenv("OPENAI_API_KEY")
-    or "EMPTY"
-)
-# Scaler also injects LLM_BASE_URL (their LiteLLM proxy).
-# Fall back to ENV_BASE_URL/v1 so local runs still work.
-LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", f"{ENV_BASE_URL}/v1")
+# Scaler injects API_BASE_URL — this is BOTH the env server AND the LLM proxy base.
+API_BASE_URL: str  = os.getenv("API_BASE_URL", "http://localhost:7860").rstrip("/")
+MODEL_NAME: str    = os.getenv("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN: str      = os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "EMPTY")) or "EMPTY"
 
-MAX_EPISODE_STEPS: int  = 20
-HEALTH_RETRIES: int     = 10
+# The OpenEnv server base (for /reset, /step, /health)
+ENV_BASE_URL: str  = API_BASE_URL
+
+# The LLM proxy base — Scaler routes LLM calls through API_BASE_URL
+# We append /v1 only if the URL doesn't already end with /v1
+if API_BASE_URL.endswith("/v1"):
+    LLM_BASE_URL = API_BASE_URL
+else:
+    LLM_BASE_URL = API_BASE_URL + "/v1"
+
+MAX_EPISODE_STEPS: int    = 20
+HEALTH_RETRIES: int       = 10
 HEALTH_RETRY_DELAY: float = 5.0
 
 # ── Logging helper ────────────────────────────────────────────────────────────
 def log(msg: str) -> None:
     print(msg, flush=True)
 
-# ── LLM client (uses Scaler proxy when running under the evaluator) ───────────
-llm = OpenAI(base_url=LLM_BASE_URL, api_key=API_KEY)
+# ── LLM client — uses Scaler's injected API_BASE_URL + HF_TOKEN ──────────────
+llm = OpenAI(base_url=LLM_BASE_URL, api_key=HF_TOKEN)
 
 SYSTEM_PROMPT = """You are an expert SQL agent operating inside an interactive database environment.
 
@@ -72,7 +60,7 @@ STRATEGY:
 - First examine ALL available tables to understand the schema.
 - Run test queries to validate your understanding.
 - Once confident, submit your solution.
-- Be efficient: aim to solve tasks in ≤10 steps.
+- Be efficient: aim to solve tasks in <=10 steps.
 - Think carefully about the task requirements before submitting.
 """
 
@@ -110,14 +98,12 @@ def parse_action(text: str) -> dict:
 
 # ── Environment helpers ───────────────────────────────────────────────────────
 def env_post(path: str, **kwargs) -> dict:
-    url = f"{ENV_BASE_URL}{path}"
-    r = requests.post(url, timeout=30, **kwargs)
+    r = requests.post(f"{ENV_BASE_URL}{path}", timeout=30, **kwargs)
     r.raise_for_status()
     return r.json()
 
 def env_get(path: str) -> dict:
-    url = f"{ENV_BASE_URL}{path}"
-    r = requests.get(url, timeout=30)
+    r = requests.get(f"{ENV_BASE_URL}{path}", timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -127,8 +113,7 @@ _server_process = None
 def start_server_if_needed() -> None:
     global _server_process
     try:
-        r = requests.get(f"{ENV_BASE_URL}/health", timeout=3)
-        if r.status_code == 200:
+        if requests.get(f"{ENV_BASE_URL}/health", timeout=3).status_code == 200:
             log("[SERVER] Already running — skipping auto-start.")
             return
     except Exception:
@@ -153,16 +138,10 @@ def wait_for_server() -> bool:
             return True
         except Exception as exc:
             if attempt < HEALTH_RETRIES:
-                log(
-                    f"[HEALTH] attempt={attempt} server not ready "
-                    f"({type(exc).__name__}), retrying in {HEALTH_RETRY_DELAY}s ..."
-                )
+                log(f"[HEALTH] attempt={attempt} server not ready ({type(exc).__name__}), retrying in {HEALTH_RETRY_DELAY}s ...")
                 time.sleep(HEALTH_RETRY_DELAY)
             else:
-                log(
-                    f"[HEALTH] attempt={attempt} server unreachable after "
-                    f"{HEALTH_RETRIES} retries ({type(exc).__name__}: {exc})"
-                )
+                log(f"[HEALTH] attempt={attempt} server unreachable after {HEALTH_RETRIES} retries ({type(exc).__name__}: {exc})")
     return False
 
 # ── Episode runner ────────────────────────────────────────────────────────────
@@ -195,7 +174,6 @@ def run_episode(task_id: str) -> float:
                 f"Recent history: {json.dumps(obs.get('query_history', [])[-3:])}\n\n"
                 "What is your next action? (JSON only)"
             )
-
             conversation.append({"role": "user", "content": user_msg})
 
             try:
@@ -211,16 +189,14 @@ def run_episode(task_id: str) -> float:
             except Exception:
                 break
 
-            obs       = step_data.get("observation", {})
-            reward    = step_data.get("reward", {})
-            reward_val = reward.get("value", 0.0)
+            obs        = step_data.get("observation", {})
+            reward_val = step_data.get("reward", {}).get("value", 0.0)
             steps_taken = step_num
 
             log(f"[STEP] step={step_num} reward={reward_val}")
 
             if step_data.get("done"):
-                info = step_data.get("info") or {}
-                final_score = info.get("score", 0.0)
+                final_score = (step_data.get("info") or {}).get("score", 0.0)
                 break
 
     except Exception:
@@ -232,13 +208,12 @@ def run_episode(task_id: str) -> float:
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     start_server_if_needed()
-    server_ok = wait_for_server()
 
-    if not server_ok:
+    if not wait_for_server():
         zero_scores = {
-            "fix_broken_query":    0.0,
+            "fix_broken_query":     0.0,
             "write_business_query": 0.0,
-            "complex_analytics":   0.0,
+            "complex_analytics":    0.0,
         }
         for task_id in zero_scores:
             log(f"[START] task={task_id}")
@@ -252,7 +227,7 @@ def main() -> None:
             pass
         return
 
-    tasks = ["fix_broken_query", "write_business_query", "complex_analytics"]
+    tasks  = ["fix_broken_query", "write_business_query", "complex_analytics"]
     scores: dict = {}
     t0 = time.time()
 
@@ -267,7 +242,6 @@ def main() -> None:
 
     elapsed = time.time() - t0
     avg = sum(scores.values()) / max(len(scores), 1)
-
     log(f"[SUMMARY] avg_score={avg} elapsed={elapsed:.1f}s")
 
     try:
