@@ -23,6 +23,7 @@ Environment variables:
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -37,8 +38,34 @@ LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 MAX_EPISODE_STEPS: int = 20
 
 # Health-check retry settings
-HEALTH_RETRIES: int        = 5
-HEALTH_RETRY_DELAY: float  = 6.0   # seconds between retries
+HEALTH_RETRIES: int        = 10
+HEALTH_RETRY_DELAY: float  = 5.0   # seconds between retries
+
+# ── Auto-start server ─────────────────────────────────────────────────────────
+_server_process = None
+
+def start_server_if_needed() -> None:
+    """Launch main.py as a background process if the server is not already running."""
+    global _server_process
+    try:
+        r = requests.get(f"{ENV_BASE_URL}/health", timeout=3)
+        if r.status_code == 200:
+            print("[SERVER] Already running — skipping auto-start.")
+            return
+    except Exception:
+        pass  # Not running yet — start it
+
+    server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+    if not os.path.exists(server_script):
+        print("[SERVER] main.py not found — skipping auto-start.")
+        return
+
+    print("[SERVER] Starting main.py in the background ...")
+    _server_process = subprocess.Popen(
+        [sys.executable, server_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 # ── LLM client ───────────────────────────────────────────────────────────────
 llm = OpenAI(base_url=LLM_BASE_URL, api_key=HF_TOKEN)
@@ -202,6 +229,7 @@ def run_episode(task_id: str) -> float:
 
 
 def main() -> None:
+    start_server_if_needed()
     server_ok = wait_for_server()
     if not server_ok:
         # Server is unreachable — write zero scores so the evaluator still gets
@@ -251,6 +279,11 @@ def main() -> None:
             )
     except Exception as exc:
         print(f"[ERROR] Could not write baseline_scores.json: {exc}")
+
+    # Stop the server if we started it
+    if _server_process is not None:
+        print("[SERVER] Shutting down background server ...")
+        _server_process.terminate()
 
 
 if __name__ == "__main__":
