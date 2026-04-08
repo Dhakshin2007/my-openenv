@@ -38,8 +38,12 @@ LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
 MAX_EPISODE_STEPS: int = 20
 
 # Health-check retry settings
-HEALTH_RETRIES: int        = 10
-HEALTH_RETRY_DELAY: float  = 5.0   # seconds between retries
+HEALTH_RETRIES: int       = 10
+HEALTH_RETRY_DELAY: float = 5.0  # seconds between retries
+
+# ── Logging helper (flush=True is required by the hackathon evaluator) ────────
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 # ── Auto-start server ─────────────────────────────────────────────────────────
 _server_process = None
@@ -50,17 +54,17 @@ def start_server_if_needed() -> None:
     try:
         r = requests.get(f"{ENV_BASE_URL}/health", timeout=3)
         if r.status_code == 200:
-            print("[SERVER] Already running — skipping auto-start.")
+            log("[SERVER] Already running — skipping auto-start.")
             return
     except Exception:
         pass  # Not running yet — start it
 
     server_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
     if not os.path.exists(server_script):
-        print("[SERVER] main.py not found — skipping auto-start.")
+        log("[SERVER] main.py not found — skipping auto-start.")
         return
 
-    print("[SERVER] Starting main.py in the background ...")
+    log("[SERVER] Starting main.py in the background ...")
     _server_process = subprocess.Popen(
         [sys.executable, server_script],
         stdout=subprocess.DEVNULL,
@@ -152,13 +156,13 @@ def wait_for_server() -> bool:
             return True
         except Exception as exc:
             if attempt < HEALTH_RETRIES:
-                print(
+                log(
                     f"[HEALTH] attempt={attempt} server not ready "
                     f"({type(exc).__name__}), retrying in {HEALTH_RETRY_DELAY}s ..."
                 )
                 time.sleep(HEALTH_RETRY_DELAY)
             else:
-                print(
+                log(
                     f"[HEALTH] attempt={attempt} server unreachable after "
                     f"{HEALTH_RETRIES} retries ({type(exc).__name__}: {exc})"
                 )
@@ -167,13 +171,17 @@ def wait_for_server() -> bool:
 
 def run_episode(task_id: str) -> float:
     final_score = 0.0
-    print(f"[START] task_id={task_id}")
+    steps_taken = 0
+
+    # ── Required structured output — evaluator looks for this exact format ──
+    log(f"[START] task={task_id}")
+
     try:
         data = env_post("/reset", params={"task_id": task_id})
         session_id = data.get("session_id")
         obs = data.get("observation")
         if not session_id or not obs:
-            print(f"[END] task_id={task_id} score=0.0")
+            log(f"[END] task={task_id} score=0.0 steps=0")
             return 0.0
 
         conversation: list = []
@@ -202,10 +210,6 @@ def run_episode(task_id: str) -> float:
             conversation.append({"role": "assistant", "content": llm_text})
             action = parse_action(llm_text)
 
-            action_label = action.get("action_type", "?")
-            action_detail = (action.get("table_name") or action.get("sql", "")[:60]).replace("\n", " ")
-            print(f"[STEP] step={step_num} action={action_label} detail={action_detail!r}")
-
             try:
                 step_data = env_post(f"/step/{session_id}", json=action)
             except Exception:
@@ -214,38 +218,45 @@ def run_episode(task_id: str) -> float:
             obs = step_data.get("observation", {})
             reward = step_data.get("reward", {})
             reward_val = reward.get("value", 0.0)
-            reward_msg = reward.get("reason", "").replace("\n", " ")[:70]
-            print(f"[REWARD] value={reward_val} reason={reward_msg!r}")
+            steps_taken = step_num
+
+            # ── Required structured output ──
+            log(f"[STEP] step={step_num} reward={reward_val}")
 
             if step_data.get("done"):
                 info = step_data.get("info") or {}
                 final_score = info.get("score", 0.0)
                 break
+
     except Exception:
         pass
 
-    print(f"[END] task_id={task_id} score={final_score}")
+    # ── Required structured output ──
+    log(f"[END] task={task_id} score={final_score} steps={steps_taken}")
     return final_score
 
 
 def main() -> None:
     start_server_if_needed()
     server_ok = wait_for_server()
+
     if not server_ok:
-        # Server is unreachable — write zero scores so the evaluator still gets
-        # a valid JSON artifact and exit cleanly (exit code 0).
-        print("[SUMMARY] avg_score=0.0 elapsed=0.0s")
+        # Server unreachable — emit required blocks with zeros and exit cleanly
         zero_scores = {
             "fix_broken_query": 0.0,
             "write_business_query": 0.0,
             "complex_analytics": 0.0,
         }
+        for task_id in zero_scores:
+            log(f"[START] task={task_id}")
+            log(f"[STEP] step=0 reward=0.0")
+            log(f"[END] task={task_id} score=0.0 steps=0")
+        log("[SUMMARY] avg_score=0.0 elapsed=0.0s")
         try:
             with open("baseline_scores.json", "w") as fh:
                 json.dump(
                     {"scores": zero_scores, "average": 0.0, "elapsed_seconds": 0.0},
-                    fh,
-                    indent=2,
+                    fh, indent=2,
                 )
         except Exception:
             pass
@@ -260,7 +271,7 @@ def main() -> None:
             score = run_episode(task_id)
             scores[task_id] = score
     except Exception as exc:
-        print(f"[ERROR] Unexpected error during episodes: {type(exc).__name__}: {exc}")
+        log(f"[ERROR] Unexpected error during episodes: {type(exc).__name__}: {exc}")
         for task_id in tasks:
             if task_id not in scores:
                 scores[task_id] = 0.0
@@ -268,21 +279,20 @@ def main() -> None:
     elapsed = time.time() - t0
     avg = sum(scores.values()) / max(len(scores), 1)
 
-    print(f"[SUMMARY] avg_score={avg} elapsed={elapsed:.1f}s")
+    log(f"[SUMMARY] avg_score={avg} elapsed={elapsed:.1f}s")
 
     try:
         with open("baseline_scores.json", "w") as fh:
             json.dump(
                 {"scores": scores, "average": avg, "elapsed_seconds": elapsed},
-                fh,
-                indent=2,
+                fh, indent=2,
             )
     except Exception as exc:
-        print(f"[ERROR] Could not write baseline_scores.json: {exc}")
+        log(f"[ERROR] Could not write baseline_scores.json: {exc}")
 
-    # Stop the server if we started it
+    # Stop the server if we auto-started it
     if _server_process is not None:
-        print("[SERVER] Shutting down background server ...")
+        log("[SERVER] Shutting down background server ...")
         _server_process.terminate()
 
 
@@ -290,6 +300,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        # Last-resort safety net — ensures we never exit with an unhandled traceback.
-        print(f"[ERROR] Fatal error in main: {type(exc).__name__}: {exc}")
+        # Last-resort safety net — never exit with an unhandled traceback
+        print(f"[ERROR] Fatal error in main: {type(exc).__name__}: {exc}", flush=True)
         sys.exit(0)
